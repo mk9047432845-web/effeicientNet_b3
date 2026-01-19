@@ -1,3 +1,53 @@
-*.tflite
-uploads/
+# =====================
+# Python cache
+# =====================
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# =====================
+# Virtual environments
+# =====================
+venv/
+.env/
+.venv/
+
+# =====================
+# Model files (BIG FILES)
+# =====================
+models_cache/
+*.h5
+*.pth
+*.tflite
+*.onnx
+
+# =====================
+# Uploaded images
+# =====================
+uploads/
+
+# =====================
+# OS / Editor files
+# =====================
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+
+# =====================
+# Logs
+# =====================
+*.log
+
+# =====================
+# Gunicorn / Flask
+# =====================
+*.pid
+*.sock
+
+# =====================
+# HuggingFace / ML cache (optional)
+# =====================
+.cache/
