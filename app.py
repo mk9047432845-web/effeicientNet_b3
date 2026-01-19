@@ -1,30 +1,39 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import os, requests, gc
+import os
+import requests
 import numpy as np
 from PIL import Image
-import torch
-from torchvision import models, transforms
+from tflite_runtime.interpreter import Interpreter
 
 # =====================
-# CONFIG & PATHS
+# APP CONFIG
 # =====================
 app = Flask(__name__)
 CORS(app)
 
-MODEL_DIR = "models_cache"
-UPLOAD_FOLDER = "uploads"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models_cache")
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+
 os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-CLASS_LABELS = ["benign", "malignant", "normal"]
 ALLOWED_EXT = {"jpg", "jpeg", "png"}
+CLASS_LABELS = ["benign", "malignant", "normal"]
 
 # =====================
-# MODEL CONFIG (ONLY B3)
+# MODEL CONFIG (TFLITE)
 # =====================
-MODEL_URL = "https://huggingface.co/mani880740255/skin_care_tflite/resolve/main/efficientnet_b3_skin_cancer.pth"
-MODEL_PATH = os.path.join(MODEL_DIR, "efficientnet_b3.pth")
+MODEL_URL = (
+    "https://huggingface.co/mani880740255/skin_care_tflite/"
+    "resolve/main/skin_cancer_mobilenetv2.tflite"
+)
+MODEL_PATH = os.path.join(MODEL_DIR, "skin_cancer_mobilenetv2.tflite")
+
+interpreter = None
+input_details = None
+output_details = None
 
 # =====================
 # CHAT DATA
@@ -38,50 +47,57 @@ CHAT_RESPONSES = {
 }
 
 # =====================
-# HELPERS
+# UTILITIES
 # =====================
-def allowed_file(name):
-    return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
-def ensure_model_exists():
+
+def load_model():
+    """Download and load TFLite model (lazy loading)."""
+    global interpreter, input_details, output_details
+
+    if interpreter is not None:
+        return
+
     if not os.path.exists(MODEL_PATH):
-        print("Downloading EfficientNet-B3 model...")
+        print("Downloading TFLite model...")
         r = requests.get(MODEL_URL, stream=True)
-        if r.status_code == 200:
-            with open(MODEL_PATH, "wb") as f:
-                for chunk in r.iter_content(8192):
-                    f.write(chunk)
-        else:
-            raise Exception("Model download failed")
+        if r.status_code != 200:
+            raise RuntimeError("Failed to download model")
 
-# =====================
-# EFFICIENTNET-B3 PREDICT
-# =====================
-def predict_b3(img_path):
-    ensure_model_exists()
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-    model = models.efficientnet_b3(weights=None)
-    model.classifier[1] = torch.nn.Linear(1536, 3)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
-    model.eval()
+    print("Loading TFLite model...")
+    interpreter = Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
 
-    transform = transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.ToTensor()
-    ])
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
 
-    img = Image.open(img_path).convert("RGB")
-    img = transform(img).unsqueeze(0)
 
-    with torch.no_grad():
-        output = model(img)
-        probs = torch.softmax(output, dim=1)[0].tolist()
+def preprocess_image(image_path: str) -> np.ndarray:
+    img = Image.open(image_path).convert("RGB")
+    img = img.resize((224, 224))
+    img = np.array(img, dtype=np.float32) / 255.0
+    img = np.expand_dims(img, axis=0)
+    return img
 
-    del model
-    gc.collect()
 
-    idx = int(np.argmax(probs))
-    return idx, probs
+def predict_image(image_path: str):
+    load_model()
+
+    img = preprocess_image(image_path)
+
+    interpreter.set_tensor(input_details[0]["index"], img)
+    interpreter.invoke()
+
+    preds = interpreter.get_tensor(output_details[0]["index"])[0]
+    idx = int(np.argmax(preds))
+
+    return idx, preds.tolist()
 
 # =====================
 # ROUTES
@@ -90,58 +106,61 @@ def predict_b3(img_path):
 def home():
     return render_template("index.html")
 
+
 @app.route("/predict", methods=["POST"])
 def predict():
     if "image" not in request.files:
-        return jsonify({"error": "Image required"}), 400
+        return jsonify({"error": "Image file required"}), 400
 
     file = request.files["image"]
-    if not allowed_file(file.filename):
-        return jsonify({"error": "Invalid file type"}), 400
 
-    path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(path)
+    if file.filename == "" or not allowed_file(file.filename):
+        return jsonify({"error": "Invalid image file"}), 400
+
+    save_path = os.path.join(UPLOAD_DIR, file.filename)
+    file.save(save_path)
 
     try:
-        idx, probs = predict_b3(path)
+        idx, probs = predict_image(save_path)
         return jsonify({
-            "model_used": "efficientnet_b3",
+            "model": "MobileNetV2 (TFLite)",
             "prediction": CLASS_LABELS[idx],
             "confidence": float(probs[idx]),
             "probabilities": {
-                CLASS_LABELS[i]: probs[i] for i in range(3)
+                CLASS_LABELS[i]: float(probs[i]) for i in range(len(CLASS_LABELS))
             }
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        if os.path.exists(path):
-            os.remove(path)
+        if os.path.exists(save_path):
+            os.remove(save_path)
 
-# Example Flask Backend
-@app.route('/chat', methods=['POST'])
+
+@app.route("/chat", methods=["POST"])
 def chat():
-    data = request.json
-    user_msg = data.get("message", "").lower().strip() # Clean the input
+    data = request.get_json(silent=True) or {}
+    msg = data.get("message", "").lower().strip()
 
-    # 1. Provide initial suggestions if message is empty
-    if user_msg == "":
+    if not msg:
         return jsonify({
-            "suggestions": list(CHAT_RESPONSES.keys())[:3] # Returns first 3 keys as buttons
+            "reply": "",
+            "suggestions": list(CHAT_RESPONSES.keys())[:3]
         })
-    
-    # 2. Check if the user's question exists in our dictionary
-    if user_msg in CHAT_RESPONSES:
+
+    if msg in CHAT_RESPONSES:
         return jsonify({
-            "reply": CHAT_RESPONSES[user_msg],
+            "reply": CHAT_RESPONSES[msg],
             "suggestions": []
         })
-    
-    # 3. Fallback if question isn't recognized
+
     return jsonify({
-        "reply": "I'm sorry, I only answer specific skin health questions. Try using the suggested buttons.",
+        "reply": "I can answer basic skin health questions. Please use the suggestions.",
         "suggestions": list(CHAT_RESPONSES.keys())
     })
 
+# =====================
+# ENTRY POINT
+# =====================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
